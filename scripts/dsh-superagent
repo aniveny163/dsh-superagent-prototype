@@ -63,14 +63,26 @@ def ps(*options, check=False):
             yield int(parts[0]), parts[1], parts[2].split()
 
 
+def is_service(name, args):
+    """Return whether a process name and argument list could be a DSH service process.
+
+    A `dsh` or `node` launcher keeps that name, but the desktop build renames itself to
+    "DeepSeek Harness" (with a space, so `ucomm` is truncated). The name alone is therefore not
+    enough: the desktop host also loads the CLI, which `serves` then matches by `--profile`.
+    """
+    if name in ('node', 'dsh', 'DeepSeek Harness', 'DeepSeek', 'Electron'):
+        return True
+    return any(word.endswith('dsh-desktop-host/lib/cli.js') or word.endswith('/dsh/lib/cli.js') for word in args)
+
+
 def running(pid, profile):
     """Return whether `pid` is currently running the DSH service for `profile` (`ps -p` returns nothing once exited)."""
-    return any(found == pid and name in ('node', 'dsh') and serves(args, profile) for found, name, args in ps('-p', str(pid)))
+    return any(found == pid and is_service(name, args) and serves(args, profile) for found, name, args in ps('-p', str(pid)))
 
 
 def processes(profile):
     """Return PIDs of all running DSH service processes for `profile`, including instances started outside this script and the recorded `service.pid` while still running."""
-    found = [pid for pid, name, args in ps('-ax', check=True) if name in ('node', 'dsh') and serves(args, profile)]
+    found = [pid for pid, name, args in ps('-ax', check=True) if is_service(name, args) and serves(args, profile)]
     try:
         pid = int((control(profile) / 'service.pid').read_text())
     except (OSError, ValueError):
@@ -127,6 +139,73 @@ def status(args):
                       'errors': current and current['errors'], 'setup': current and current['setup'],
                       'feishu': current and current['feishu']}, ensure_ascii=False, indent=2))
     return outcome(pids, current)
+
+
+TICKET_ATTENTION = 4
+
+
+def tickets(url):
+    """Fetch the ticket list from the management API, or return None when unreachable.
+
+    Kept separate from `state()` because a healthy service happily reports exit code 0 while a
+    ticket inside it is stuck on `action: failed`; a monitor that only reads component health
+    never sees that. See `ticket_problems()` for which fields mean "needs a human".
+    """
+    request = urllib.request.Request(url.rstrip('/') + '/orchestrator/api/tickets',
+                                     headers={'x-orchestrator-request': '1'})
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            value = json.load(response)
+    except (OSError, ValueError):
+        return None
+    if isinstance(value, dict):
+        value = value.get('tickets') or value.get('items') or []
+    if not isinstance(value, list):
+        return None
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
+def ticket_problems(items):
+    """Return the tickets a human has to look at, one line each.
+
+    Only three states need attention:
+      - `action: failed` / `action: blocked` — the worker stopped and cannot continue by itself;
+      - an error note — same condition, reported through `note` instead of `action`;
+      - `action: review` with no PR and no reply — finished work that never reached the operator.
+
+    A ticket still working, or one already delivered (review with a PR or a reply), is not a
+    problem: the first is progress, the second waits on a person by design.
+    """
+    problems = []
+    for entry in items:
+        note = entry.get('note') or {}
+        action = entry.get('action')
+        title = str(entry.get('title') or '').strip() or '(untitled)'
+        stage = entry.get('stage')
+        detail = str(note.get('text') or '').strip() if isinstance(note, dict) else ''
+        if action in ('failed', 'blocked') or (isinstance(note, dict) and note.get('error')):
+            problems.append({'id': entry.get('id'), 'title': title, 'stage': stage,
+                             'action': action or 'failed', 'detail': detail,
+                             'needs': 'retry' if entry.get('actions', {}).get('retry') else 'inspect'})
+        elif action == 'review' and not entry.get('pr') and not entry.get('reply'):
+            problems.append({'id': entry.get('id'), 'title': title, 'stage': stage,
+                             'action': 'review', 'detail': detail or 'finished without a PR or reply',
+                             'needs': 'inspect'})
+    return problems
+
+
+def report_tickets(args):
+    """Print the tickets needing attention and return an exit code that says whether there are any."""
+    items = tickets(args.url)
+    if items is None:
+        print(json.dumps({'url': args.url, 'reachable': False,
+                          'problem': 'The management API did not answer; check the service first.'},
+                         ensure_ascii=False, indent=2))
+        return 1
+    problems = ticket_problems(items)
+    print(json.dumps({'url': args.url, 'reachable': True, 'total': len(items),
+                      'attention': len(problems), 'tickets': problems}, ensure_ascii=False, indent=2))
+    return TICKET_ATTENTION if problems else 0
 
 
 def stop(args, intentional=True):
@@ -208,7 +287,7 @@ def start(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status'])
+    parser.add_argument('action', choices=['start', 'stop', 'restart', 'status', 'tickets'])
     parser.add_argument('--profile', default=os.environ.get('DSH_SUPERAGENT_PROFILE') or 'superagent',
                         help='DSH profile that loads dsh-superagent; its tmux session is dsh-<profile>.')
     parser.add_argument('--url', default=os.environ.get('DSH_SUPERAGENT_URL') or 'http://127.0.0.1:3082',
@@ -224,6 +303,10 @@ def main():
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', args.profile):
         parser.error('--profile must be a DSH profile name')
     os.umask(0o077)
+    # `tickets` only reads the management API; taking the control lock would make it wait behind
+    # a restart it does not affect, so it answers before the lock is taken.
+    if args.action == 'tickets':
+        return report_tickets(args)
     with (control(args.profile) / 'operation.lock').open('a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
