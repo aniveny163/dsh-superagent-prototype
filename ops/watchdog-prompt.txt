@@ -1,0 +1,49 @@
+巡检 dsh-superagent 服务（profile `superagent`，工作目录 /Users/dyf/src/dsh-superagent）。
+
+执行时务必显式指定 PATH，否则找不到 dsh。
+
+### 第一步：服务健康
+
+```
+env -i HOME="$HOME" PATH="/Users/dyf/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" /usr/bin/python3 /Users/dyf/src/dsh-superagent/scripts/dsh-superagent --profile superagent status
+```
+
+按退出码处理：
+
+- **0**：服务正常，继续第二步。
+- **2**：服务在跑但某个部件报错。**不要重启**。把 `errors` 里的每个部件和 detail 告诉王一清（同一批错误只说一次）。
+- **3**：服务在等 setup。**不要重启**。把 `setup` 要求的内容告诉王一清（同一批只说一次）。
+- 如果输出里 `manually_stopped: true`，保持停止，不要动，也不要跑第二步。
+- **1**：服务没跑 / 跑了两份 / 没响应 / runtime 报错。执行恢复：
+  ```
+  env -i HOME="$HOME" PATH="/Users/dyf/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" /usr/bin/python3 /Users/dyf/src/dsh-superagent/scripts/dsh-superagent --profile superagent --respect-stop restart
+  ```
+  该命令退出码含义同上：0 表示已恢复，此时不要说任何话；2 和 3 按上面报给王一清。
+  若仍为 1 或命令本身失败，读最新的 `.artifacts/dsh-superagent-superagent-*.log` 和 docs/006-deployment.md 的 Troubleshooting 一节，能修的修掉，然后告诉王一清哪里坏了、你做了什么。
+
+### 第二步：工单健康（这一步不能省）
+
+服务健康不代表工单没挂。**服务可能 exit 0 而工单停在 `action: failed`**——2026-11-03 就漏过一次飞书 @：服务 13 个部件全 ready，但工单因 `LlmError: Request timed out.` 失败了，巡检没发现。
+
+```
+env -i HOME="$HOME" PATH="/Users/dyf/.local/bin:/opt/homebrew/bin:/usr/bin:/bin" /usr/bin/python3 /Users/dyf/src/dsh-superagent/scripts/dsh-superagent --profile superagent tickets
+```
+
+按退出码处理：
+
+- **0**：没有需要关注的工单。**什么都不做，什么都不要说。**
+- **1**：管理 API 没响应。第一步已经处理了服务问题，这里只需确认服务是否真的起来了；不要重复报告同一个故障。
+- **4**：有工单需要关注。对 `tickets` 数组里的每一项：
+  - `needs: retry` —— 直接重试，这是可自愈的：
+    ```
+    curl -sS -X POST -H 'x-orchestrator-request: 1' http://127.0.0.1:3082/orchestrator/api/tickets/<id>/retry
+    ```
+    重试后告诉王一清：哪个工单（标题）、什么原因失败（detail）、你已经重试了。
+  - `needs: inspect` —— **不要重试**，先看明白再说。读该工单的 `directory` 目录和最近的 worker session 记录，判断是缺权限、缺依赖还是逻辑卡住，然后告诉王一清具体是什么问题。
+  - 同一批问题只说一次，别反复刷。
+
+### 注意
+
+这台机器上 dsh 以桌面应用名 `DeepSeek Harness` 运行，脚本已打过补丁适配，`status` 正常应返回 0，不要因为进程名不同而误判。
+
+王一清偏好少被打扰：一切正常时不要发任何消息。

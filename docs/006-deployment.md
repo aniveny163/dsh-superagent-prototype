@@ -130,15 +130,22 @@ Each profile stores logs and control files under `.artifacts/`:
 
 Open the URL printed in the log, then choose **Superagent** in the sidebar.
 
-### Hourly check
+### Scheduled check
 
-Create the hourly check in the DeepSeek Harness profile you normally use, not in `superagent`. It must keep running when the agent service is down. Ask an agent in that profile to create an hourly schedule using this prompt, with the checkout path filled in:
+Create the check in the DeepSeek Harness profile you normally use, not in `superagent`. It must keep running when the agent service is down. The prompt is kept in [ops/watchdog-prompt.txt](../ops/watchdog-prompt.txt) so it survives a reinstall of the harness; the checklist below is only a summary of it.
 
-```text
-Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` in <checkout>. Exit 0: do nothing and say nothing. Exit 2: do not restart; tell me each part under `errors` with its detail, unless you already told me about the same ones. Exit 3: do not restart; tell me what `setup` says setup needs, unless you already told me. If it reports manually_stopped: true, leave it stopped. Otherwise (exit 1) run `scripts/dsh-superagent --profile superagent --respect-stop restart`, which exits the same way: 0 means it recovered, so say nothing; 2 and 3 are reported as above; if it exits 1 or fails otherwise, read the newest .artifacts/dsh-superagent-superagent-*.log and the Troubleshooting section of docs/006-deployment.md, fix what you can, and tell me what was wrong and what you did.
-```
+The check has two steps, and the second one is not optional:
+
+1. **Component health** — `scripts/dsh-superagent --profile superagent status`. Exit 0: continue to step 2 and say nothing. Exit 2: do not restart; report each part under `errors` with its detail, unless already reported. Exit 3: do not restart; report what `setup` needs, unless already reported. If it reports `manually_stopped: true`, leave it stopped and skip step 2. Otherwise (exit 1) run `scripts/dsh-superagent --profile superagent --respect-stop restart`, which exits the same way: 0 means it recovered, so say nothing; 2 and 3 are reported as above; if it exits 1 or fails otherwise, read the newest `.artifacts/dsh-superagent-superagent-*.log` and the Troubleshooting section below, fix what you can, and report what was wrong and what you did.
+2. **Ticket health** — `scripts/dsh-superagent --profile superagent tickets`. Exit 0: nothing needs attention, say nothing. Exit 1: the management API is unreachable, which step 1 already handles, so do not report the same fault twice. Exit 4: tickets need attention; retry the ones marked `needs: retry`, and inspect the ones marked `needs: inspect` before touching them.
+
+A healthy service does not imply healthy tickets: component health can report every part `ready` and exit 0 while a Ticket sits on `action: failed`, because a failed Turn is not a failed component. A check that reads only `status` therefore misses exactly the case the operator cares about — a request that arrived and went nowhere.
+
+`tickets` reads only the management API, so it answers before the control lock is taken; otherwise it would wait behind a restart it has no stake in.
 
 `--respect-stop` preserves an intentional stop. Only `stop` writes the marker; `start` clears it. `restart` writes no marker, so the check can recover a restart whose shutdown timed out.
+
+The check needs a cadence that matches how the service is used. Once a day is enough when the operator is also watching the source chats themselves; the point of the ticket step is to catch what they did not notice, not to replace reading their own messages.
 
 ## Settings
 
@@ -176,6 +183,7 @@ Agents may rely on these routes and fields. The other routes in `src/app/api.ts`
 | `POST setup/check` | Runs setup again by restarting dsh-superagent: `restarting: true`. Refused when setup has nothing to fix |
 | `POST policy-sync/<source id>` | Syncs that Source's allowed list now: `policy`, the Source's part as saved |
 | `GET prompts`, `PUT prompts` with `{"config", "baseRevision"}` | Reads the prompt configuration: `current`, with its `revision` and `config`, `defaults`, `sections`, the team sections in the order Sessions read them, `skillName`, the pattern of a team skill's name, `builtin`, the names a team skill cannot take, and `skillPrefix`, which Sessions load a skill's name under. Or saves it: the new `revision` |
+| `GET tickets` | The Ticket list, newest work last: each Ticket's `id`, `title`, `state`, `stage`, `action` (`failed`, `blocked` or `review` when it needs a person, otherwise absent), its `note` with `text` and `error`, its `actions` (`retry`, `stop`), `directory`, `summary`, `pr` and `reply`. `scripts/dsh-superagent tickets` reads this route |
 | `POST tickets/<id>/retry`, `POST tickets/<id>/stop` | Retries or stops a Ticket, as the panel does |
 
 Health entries are grouped by responsibility:
